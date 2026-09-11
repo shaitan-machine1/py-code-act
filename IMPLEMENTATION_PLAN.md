@@ -21,7 +21,7 @@ The first supported provider is OpenAI only, through either the public API or th
 
 - Regular CPython 3.14 (not the free-threaded build) and uv packaging under `src/py_code_act/`
 - OpenAI Responses API using `OPENAI_API_KEY` authentication
-- OpenAI Codex/ChatGPT authentication using a headless OAuth device-code flow
+- OpenAI Codex/ChatGPT subscription authentication using both manual browser OAuth and a headless device-code flow
 - Provider-neutral internal interfaces, with OpenAI public-API and Codex transports only
 - Streaming assistant text and reasoning events where OpenAI exposes them
 - A strict streaming `<exec>` parser
@@ -34,8 +34,7 @@ The first supported provider is OpenAI only, through either the public API or th
 - An injected, self-describing `tools` Python namespace backed by harness RPC
 - A simple harness-owned todo service
 - Pi-style Agent Skills discovery with progressive disclosure through `tools.skills`
-- Interrupt, timeout, restart, output truncation, and artifact handling
-- Manual and eventual automatic context compaction
+- Interrupt, timeout, restart, and kernel-loss recovery
 - Unit, integration, and scripted end-to-end tests
 
 ### Explicitly excluded from the initial implementation
@@ -50,7 +49,9 @@ The first supported provider is OpenAI only, through either the public API or th
 - Extensions, plugins, packages, themes, and a generic resource loader beyond the focused skills loader
 - MCP, subagents, and plan mode
 - Permission dialogs or sandboxing
-- OAuth and subscription authentication
+- OAuth and subscription authentication for providers other than OpenAI Codex/ChatGPT
+- Output truncation and execution-output artifacts
+- Manual or automatic context compaction
 - Image input or generation
 - Dynamic model catalogs
 - Session trees, branching, labels, and branch summaries
@@ -134,7 +135,6 @@ src/py_code_act/
   storage/
     __init__.py
     session_jsonl.py
-    artifacts.py
     paths.py
 
   tools/
@@ -168,9 +168,11 @@ Use typed dataclasses and explicit serialization functions. Avoid passing provid
 UserMessage
 AssistantMessage
 ExecutionMessage
-CompactionMessage
+ProtocolErrorMessage
 KernelNoticeMessage
 ```
+
+`ProtocolErrorMessage` is a model-visible transcript message used when malformed or truncated assistant output was not executed. Suggested fields are `id`, `error`, `message`, `assistant_message_id`, and `created_at`. It is converted to a synthetic user observation but is not represented as a fake kernel execution.
 
 `KernelNoticeMessage` is an internal transcript message used when the model must know that interpreter state was lost. Pure UI notices should remain session entries/events and should not enter model context.
 
@@ -203,7 +205,7 @@ created_at
 provider_metadata
 ```
 
-`provider_metadata` must be an explicitly serializable opaque mapping used only when OpenAI requires replay data. It must not contain SDK objects or credentials.
+`provider_metadata` must be an explicitly serializable opaque mapping used only when OpenAI requires replay data. It must not contain SDK objects or credentials. Match Pi's stateless OpenAI replay behavior: a `ReasoningBlock` keeps its displayable summary/text together with the complete serializable OpenAI reasoning output item, including encrypted continuation content when returned. Replay data remains opaque outside the OpenAI adapter.
 
 ### 5.3 Execution output blocks
 
@@ -212,7 +214,6 @@ StreamOutput(channel="stdout" | "stderr", text=...)
 ValueOutput(mime_type="text/plain", data=...)
 DisplayOutput(mime_type="text/plain", data=...)
 ErrorOutput(name=..., message=..., traceback=...)
-TruncationOutput(artifact_path=..., omitted_bytes=..., sha256=...)
 ```
 
 An `ExecutionMessage` should contain:
@@ -221,7 +222,7 @@ An `ExecutionMessage` should contain:
 id
 exec_id
 kernel_generation
-status: ok | error | interrupted | timed_out | kernel_lost | protocol_error
+status: ok | error | interrupted | timed_out | kernel_lost
 outputs: ordered list of output blocks
 started_at
 finished_at
@@ -334,8 +335,9 @@ turn_start
 message_start(user)
 message_end(user)
 message_start(assistant)
-message_text_delta*
+message_text_delta* (prefix)
 exec_code_delta*
+message_text_delta* (suffix)
 message_end(assistant)
 exec_start
 exec_output*
@@ -350,6 +352,18 @@ agent_end
 ```
 
 An assistant response plus its requested execution is one turn. The model response after the execution result begins the next turn.
+
+A protocol-repair interaction has no execution lifecycle because no Python runs:
+
+```text
+message_end(assistant)
+message_start(protocol_error)
+message_end(protocol_error)
+turn_end
+turn_start
+message_start(assistant)
+...
+```
 
 ## 7. Observability
 
@@ -416,23 +430,28 @@ Harness diagnostics go to the trace file. Python `print()` and Python logging pr
 Support two OpenAI-only transports selected by `RunConfig.auth_mode`:
 
 - `api_key`: use the official asynchronous OpenAI Python SDK and the public Responses API. Resolve the key from an explicit in-memory config value or `OPENAI_API_KEY` without persisting it.
-- `codex`: use a ChatGPT OAuth access token with `https://chatgpt.com/backend-api/codex/responses`. Match the request shape and required headers used by Pi's OpenAI Codex transport, including `Authorization`, `chatgpt-account-id`, `originator`, and the Responses beta header.
+- `codex`: use a ChatGPT OAuth access token with `https://chatgpt.com/backend-api/codex/responses`. Match the request shape and required headers used by Pi's OpenAI Codex transport, including `Authorization`, `chatgpt-account-id`, `originator`, and the Responses beta header. Keep `originator` set to `pi` initially.
+
+The initial Codex transport uses SSE only. Keep SSE/WebSocket mechanics inside the provider transport boundary so WebSocket support can be added later without changing the agent, protocol, persistence, or rendering layers.
 
 Neither transport sends native tool definitions or a `tools` field.
 
 ### 8.2 Codex authentication
 
-Use Pi's simpler headless device-code flow rather than requiring a local callback server:
+Copy Pi's OpenAI Codex OAuth protocol, constants, endpoints, PKCE behavior, token exchange, refresh behavior, account-ID extraction, and validation as closely as practical. Support two configured login methods when no valid credential exists:
 
-1. Request a device authorization from OpenAI and print its verification URL and user code.
-2. Poll until the user authorizes, the request expires, or the run is cancelled.
-3. Exchange the returned authorization code and PKCE verifier for access and refresh tokens.
-4. Extract the ChatGPT account ID from the access-token JWT.
-5. Refresh expired access tokens automatically.
+- `browser`: generate Pi's authorization URL and PKCE/state values, print the URL, and prompt the user to paste the full callback URL from the browser address bar after authorization. Do not start a local callback server. Parse the authorization code and state from the pasted URL, reject a state mismatch, and exchange the code using Pi's redirect URI.
+- `device_code`: copy Pi's headless flow. Request a device authorization, print the verification URL and user code, poll using the server-provided interval until authorization, expiry, failure, or cancellation, then exchange the returned authorization code and PKCE verifier.
 
-When `auth_mode="codex"` is configured and no valid credential exists, `uv run run.py` starts this login flow before opening the agent session. Store the resulting OAuth credential in the application configuration directory selected by `platformdirs`, in a file created with user-only permissions. The credential is never written to the session ledger, trace, generated `run.py`, or kernel environment.
+Both methods then:
 
-Authentication failures, malformed token responses, cancellation, and device-code expiry must produce clear terminal errors and sanitized traces. The Codex endpoints and client protocol are implementation details isolated in the auth/provider packages because they may change independently of the public OpenAI API.
+1. Store access and refresh tokens and their expiry.
+2. Extract and store the ChatGPT account ID from the access-token JWT.
+3. Refresh expired access tokens automatically and update the stored account ID.
+
+`RunConfig.auth_mode` selects `api_key` or `codex`; a separate Codex login-method setting selects `browser` or `device_code` for first login. When `auth_mode="codex"` is configured and no valid credential exists, `uv run run.py` starts the configured login flow before opening the agent session. Store the resulting OAuth credential in the application configuration directory selected by `platformdirs`, in a file created with user-only permissions. The credential is never written to the session ledger, trace, generated `run.py`, or kernel environment.
+
+Authentication failures, malformed token responses, state mismatch, cancellation, and browser/device-code expiry must produce clear terminal errors and sanitized traces. The Codex endpoints and client protocol are implementation details isolated in the auth/provider packages because they may change independently of the public OpenAI API.
 
 ### 8.3 Provider interface
 
@@ -463,8 +482,8 @@ The OpenAI adapters must:
 
 - Convert canonical transcript messages to the applicable Responses input.
 - Serialize assistant `ExecBlock` values back to `<exec>` text.
-- Serialize `ExecutionMessage` as a synthetic user observation.
-- Preserve required opaque OpenAI continuation/reasoning data when applicable.
+- Serialize `ExecutionMessage` and `ProtocolErrorMessage` as synthetic user observations.
+- Preserve and replay complete opaque OpenAI reasoning output items, including encrypted continuation content, in the same manner as Pi.
 - Normalize streamed text, reasoning summaries, usage, completion, and errors.
 - Never expose SDK or raw transport event objects outside the provider package.
 - Trace sanitized request summaries and optionally sanitized raw response events.
@@ -483,7 +502,7 @@ Configure the model directly in `run.py`; the initial preconfigured model is `gp
 Treat the markers as framing syntax, not general XML:
 
 ```text
-assistant-response := final-text | prefix-text exec-block
+assistant-response := final-text | prefix-text exec-block suffix-text
 exec-block         := OPEN_LINE python-code CLOSE_LINE
 OPEN_LINE          := line containing exactly "<exec>"
 CLOSE_LINE         := line containing exactly "</exec>"
@@ -494,10 +513,10 @@ Rules:
 1. Opening and closing markers must each be on their own line.
 2. Parse markers only from assistant text, never reasoning or execution results.
 3. Allow at most one execution block per assistant response.
-4. Allow prose before the opening marker.
-5. Require only whitespace after the closing marker.
-6. A completed closing marker ends the model action.
-7. Never execute code if the response reaches a length/error/abort termination before a complete closing marker.
+4. Allow prose before and after the execution block.
+5. A completed closing marker ends the Python block, not the assistant response; continue consuming the provider stream through its terminal event.
+6. Never execute code from a response whose normalized stop reason is `length`, `error`, or `aborted`, even if a complete block appears to have arrived. This matches Pi's conservative handling of tool calls from truncated responses.
+7. Execute only after the complete provider response is authoritative and the parser has confirmed exactly one complete execution block.
 8. Escape output when formatting observations so printed marker text cannot become executable.
 
 A line-anchored closing marker permits ordinary strings such as `print("</exec>")`. If code genuinely needs a source line containing only `</exec>`, it must construct it dynamically; this is an accepted protocol limitation.
@@ -509,23 +528,25 @@ Implement an incremental state machine:
 ```text
 TEXT
 EXEC
-COMPLETE
+AFTER_EXEC
 ERROR
 ```
 
-It must correctly handle markers split across arbitrary provider chunks and `\r\n`/`\n` boundaries. It emits prose and code deltas but retains enough state to validate final completion.
+It must correctly handle markers split across arbitrary provider chunks and `\r\n`/`\n` boundaries. It emits prose before and after the block as text deltas and emits code deltas while inside the block, but retains enough state to validate final completion. Seeing `</exec>` never cancels the provider request or starts execution early.
 
 Do not parse `<think>` in the production protocol. OpenAI reasoning is represented by native normalized reasoning events, not text tags.
 
 ### 9.3 Parser failures
 
-Malformed output becomes a structured protocol error observation so the model can retry, subject to a retry/turn limit. Examples:
+Malformed or unsafe-to-execute output becomes a `ProtocolErrorMessage` so the model can retry, subject to a retry/turn limit. It uses normal message lifecycle events and does not emit `exec_start` or `exec_end`, because no kernel execution occurred. Examples:
 
 - Closing marker without opening marker
 - Second opening marker
 - Second execution block
-- Non-whitespace trailing text
 - Stream ending inside an execution block
+- A complete-looking execution block in a response that terminates with `length`
+
+Ordinary prose after a single complete block is valid and remains part of the assistant message.
 
 ## 10. Execution-result formatting
 
@@ -546,7 +567,6 @@ Requirements:
 - Include execution and kernel IDs.
 - Distinguish no value from a value whose representation is `None` if the kernel reports one.
 - Include structured exception name, message, and sanitized traceback.
-- Indicate truncation and artifact location explicitly.
 - Keep terminal rendering independent from provider-facing formatting.
 
 Execution-result formatting should be a pure function with golden tests.
@@ -612,12 +632,20 @@ emit user message lifecycle
 
 repeat:
   build transformed provider context
-  stream OpenAI assistant response
+  stream and fully drain the OpenAI assistant response
   parse text into TextBlock/ExecBlock
-  finalize and append assistant message
+  finalize and append the authoritative assistant message
 
-  if provider failed, was aborted, or hit length:
+  if provider failed or was aborted:
     stop according to error policy
+
+  if the response hit length:
+    never execute its code
+    append a ProtocolErrorMessage and retry when an execution block needs repair
+    otherwise stop according to error policy
+
+  if parsing failed:
+    append a ProtocolErrorMessage and retry within the repair limit
 
   if no ExecBlock:
     finish run
@@ -676,7 +704,6 @@ message
 model_change
 kernel_restart
 todo_change
-compaction
 session_info
 ```
 
@@ -702,7 +729,7 @@ A linear sequence is sufficient initially. Include stable IDs so tree links can 
 - Reject or clearly report unsupported future schema versions.
 - Preserve unknown optional fields where practical.
 - Never persist API keys or OAuth credentials in the session ledger.
-- Keep large execution artifacts outside JSONL and reference them by path/hash.
+- Persist complete execution output directly in the semantic message; output artifacts are deferred.
 
 ### 14.4 Resume behavior
 
@@ -782,9 +809,9 @@ Creating a duplicate name, reading/updating an unknown name, or supplying an inv
 
 ### 15.4 Skills service
 
-Implement Agent Skills with the same progressive-disclosure behavior as Pi:
+Implement Agent Skills with the same progressive-disclosure behavior as Pi, without adding Pi's project-trust gate yet:
 
-1. Discover and validate skills at startup from Pi-compatible global/project locations and any explicit paths configured in `run.py`.
+1. Discover and validate skills at startup from Pi-compatible global locations (`~/.pi/agent/skills/` and `~/.agents/skills/`), the working directory's `.pi/skills/`, `.agents/skills/` in the working directory and its ancestors up to the Git repository root (or filesystem root outside a repository), and any explicit paths configured in `run.py`. Follow Pi's source precedence and collision behavior, with explicit configured paths taking precedence.
 2. Read `name`, `description`, and `disable-model-invocation` from YAML frontmatter. Discover directories containing `SKILL.md`; follow Pi's handling of direct Markdown skill files, diagnostics, duplicate names, ignored files, and relative paths.
 3. Add every model-visible skill's escaped name, short description, and file location to the system prompt in the Agent Skills XML format. There is no arbitrary skill-count limit.
 4. Do not preload full skill bodies. Load the complete `SKILL.md` dynamically only when selected.
@@ -806,7 +833,7 @@ tools.skills.load(name) -> SkillContent
 tools.kernel.restart()
 ```
 
-`tools.kernel.restart()` schedules work after the current cell reaches idle. It must not kill the interpreter in the middle of its own RPC call. There is no environment namespace or environment-reload operation.
+`tools.kernel.restart()` schedules work after the current cell reaches idle. It must not kill the interpreter in the middle of its own RPC call. The RPC returns and the remainder of the current cell runs in the old generation. That execution finishes normally under the old generation; the harness then replaces the kernel, increments `kernel_generation`, persists the restart, and appends a model-visible `KernelNoticeMessage` before the next provider request. `kernel_restart_requested` is emitted when the RPC request is accepted, while `kernel_restarted` is emitted only after replacement succeeds. There is no environment namespace or environment-reload operation.
 
 ## 16. Interrupt, restart, and failure handling
 
@@ -835,67 +862,23 @@ Normalize OpenAI setup, HTTP, stream, timeout, rate-limit, and cancellation fail
 
 Never automatically retry a completed or ambiguously completed Python cell. External effects may already have happened.
 
-## 17. Output limits and artifacts
+## 17. Output handling
 
-Apply limits independently to:
+Do not truncate execution output or create execution-output artifacts in the initial implementation. Preserve and render all ordered output blocks and send the complete escaped result to the model. Output limits, spill-to-artifact behavior, and bounded terminal rendering are deferred explicitly.
 
-- Individual stream blocks
-- Total output per execution
-- Value/display representation
-- Trace payload representation
-- Provider-facing execution result
+The development trace remains disposable and may contain full prompts, generated code, file content, and execution output.
 
-When output exceeds the model-context limit:
-
-1. Continue draining kernel output so execution can complete.
-2. Write full output to an artifact file.
-3. Return bounded head/tail excerpts.
-4. Include byte counts, artifact path, and SHA-256.
-5. Let the model inspect the artifact with Python if needed.
-
-Store development artifacts under `/tmp/py-code-act/artifacts/<session_id>/`. Paths must not collide across executions. Create the temporary root and artifact directories with user-only permissions where supported. Artifacts are disposable and separate from the durable session JSONL, which stores only their path/hash references.
-
-## 18. Context construction and compaction
-
-### 18.1 Context builder
+## 18. Context construction
 
 Before each OpenAI request:
 
 1. Select semantic transcript messages.
-2. Apply any compaction checkpoint.
-3. Convert internal messages to provider-compatible user/assistant input.
-4. Serialize `ExecBlock` and `ExecutionMessage` using stable protocol formatters.
-5. Add the stable system prompt.
-6. Estimate context size and apply output-specific pruning if required.
+2. Convert internal messages to provider-compatible user/assistant input.
+3. Serialize `ExecBlock`, `ExecutionMessage`, `ProtocolErrorMessage`, and `KernelNoticeMessage` using stable protocol formatters.
+4. Add the stable system prompt.
+5. Estimate context size where practical and report a clear context-overflow failure instead of silently pruning or compacting history.
 
-### 18.2 Compaction
-
-Implement after persistence and execution are stable.
-
-Manual compaction first:
-
-```text
-/compact [optional instructions]
-```
-
-A compaction entry should contain:
-
-```text
-summary
-messages or entry IDs replaced
-retained recent tail
-usage for summary generation
-created_at
-```
-
-The summary must distinguish:
-
-- Durable filesystem/process effects observed in outputs
-- Historical code that was run
-- In-memory Python variables that may still exist in the current kernel
-- In-memory state that definitely does not exist after restart/resume
-
-Automatic compaction can later trigger near the configured context limit. It must emit start/end events and remain separate from trace logging.
+Manual and automatic compaction are deferred and have no commands, session entries, or runtime events in the initial implementation.
 
 ## 19. System prompt
 
@@ -910,10 +893,10 @@ The stable system prompt must explain:
 - `tools` is available without import and can be inspected with `dir()` and `help()`.
 - The deterministic tool section is assembled from each enabled namespace's short prompt contribution.
 - Every model-visible skill is listed by short metadata, and its complete instructions must be loaded on demand through `tools.skills.load(name)`.
-- Output may be truncated to artifacts.
-- Malformed blocks are not executed.
+- Execution output is returned without initial truncation.
+- Malformed or truncated-response blocks are not executed.
 
-Keep the stable prompt deterministic for provider prompt caching. Add project instructions as a separate section. Basic `AGENTS.md` discovery may be implemented without a general extension/resource system.
+Keep the stable prompt deterministic for provider prompt caching. Add project instructions as a separate section. Implement Pi-style context-file discovery without a general extension/resource system: load the global context file from the platform configuration directory, then walk from the filesystem root toward the configured working directory so nearer instructions layer later. In each directory, use Pi's candidate precedence: `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, then `CLAUDE.MD`, loading at most one. Project trust gating is deferred.
 
 ## 20. Development entrypoint and line interface
 
@@ -935,9 +918,11 @@ from py_code_act.config import RunConfig
 CONFIG = RunConfig(
     model="gpt-5.6-sol",
     auth_mode="codex",
+    codex_login_method="browser",
     cwd=Path(__file__).parent,
-    # Session, reasoning, limits, tracing, artifacts, skills, and rendering
-    # are also explicitly preconfigured here.
+    session_path=Path(".py-code-act/session.jsonl"),
+    # Reasoning, limits, tracing, skills, and rendering are also explicitly
+    # preconfigured here.
 )
 
 if __name__ == "__main__":
@@ -948,13 +933,13 @@ The checked-in file must contain usable values for every non-secret setting so i
 
 Interactive behavior:
 
-- Complete any required Codex device login before opening the prompt.
+- Complete any required configured Codex browser or device-code login before opening the prompt.
 - Read one prompt while idle.
 - Stream a readable response through the terminal renderer.
 - Return to the input prompt when the run settles.
 - Support EOF to exit.
 - Support `Ctrl+C` cancellation.
-- Provide minimal slash commands only when required, initially `/quit`, `/new`, `/session`, `/model`, and `/compact` as they become implemented.
+- Provide minimal slash commands only when required, initially `/quit`, `/new`, `/session`, and `/model` as they become implemented.
 
 `rich` may be used for colors and block formatting without adopting a full-screen TUI. Output must remain understandable without color.
 
@@ -976,14 +961,13 @@ session data
 cache
 ```
 
-Use fixed development defaults for:
+Use a fixed development default for traces:
 
 ```text
-traces:    /tmp/py-code-act/traces/
-artifacts: /tmp/py-code-act/artifacts/
+traces: /tmp/py-code-act/traces/
 ```
 
-Durable session JSONL remains in the platform data directory and must not be placed in `/tmp`. Use the configured working directory for executed Python and project instruction/skill discovery.
+`RunConfig.session_path` selects the durable JSONL ledger directly. Create it and its parent directory on first use; if it already exists, resume it with a fresh kernel. Do not add startup session selection logic to the development runner. A checked-in development default may be project-relative, but durable sessions must not be placed in `/tmp`. Use the configured working directory for executed Python and project instruction/skill discovery.
 
 Provider credentials remain in the harness process. Start the kernel with a sanitized environment that removes known provider credential variables rather than intentionally forwarding them. This reduces accidental disclosure but is not a security guarantee because unrestricted same-user code may still inspect local process or credential sources.
 
@@ -1033,9 +1017,10 @@ Parser:
 - Unexpected close
 - Duplicate open/close
 - Multiple blocks
-- Trailing text
+- Prose after one complete block
 - End inside block
-- Provider abort/length inside block
+- Provider abort/length with incomplete and complete-looking blocks
+- No execution for any `length` response
 - Reasoning input never parsed as executable code
 
 Formatting:
@@ -1044,7 +1029,6 @@ Formatting:
 - Ordered mixed stdout/stderr/value
 - Exceptions
 - Empty output
-- Truncation references
 - Malicious output containing protocol tags
 
 Observability:
@@ -1059,8 +1043,9 @@ Agent loop:
 
 - Text-only completion
 - One and multiple sequential cells across turns
-- Protocol correction
+- Protocol correction through persisted `ProtocolErrorMessage` values
 - Provider failure
+- Complete-looking execution withheld after a `length` stop
 - Execution failure
 - Turn limits
 - Cancellation
@@ -1085,12 +1070,18 @@ Todo and tool registry:
 
 Skills:
 
-- Pi-compatible discovery locations and ignore behavior
+- Pi-compatible discovery locations and ignore behavior without trust gating
 - YAML frontmatter parsing and validation diagnostics
-- Duplicate-name precedence
+- Duplicate-name precedence, including explicit configured paths
 - `disable-model-invocation`
 - Escaped prompt metadata for every visible skill with no count limit
 - Dynamic full-content loading and base-directory resolution
+
+Context files:
+
+- Pi-compatible global and root-to-working-directory ordering
+- Candidate precedence and `AGENTS.override.md` behavior
+- At most one context file loaded from each directory
 
 ### 23.2 Kernel integration tests
 
@@ -1121,8 +1112,10 @@ Verify:
 
 - Public API and Codex request conversion
 - No `tools` field/schema is sent by either transport
+- Codex manual browser authorization URL/callback parsing, PKCE, state validation, token exchange, and cancellation
 - Codex device authorization, pending polling, token exchange, cancellation, and expiry
 - OAuth token refresh, account-ID extraction, credential permissions, and redaction
+- SSE-only initial Codex streaming with transport details isolated behind the provider boundary
 - Stream normalization
 - Usage
 - Errors and partial output
@@ -1153,7 +1146,7 @@ Keep live OpenAI smoke tests optional and explicitly enabled through an environm
 
 - Remove the placeholder package console script and add the root `run.py` development entrypoint.
 - Define the typed `RunConfig` and package-level application function called by `run.py`.
-- Preconfigure every non-secret development setting, including `gpt-5.6-sol`, Codex auth, `/tmp` traces/artifacts, durable sessions, skills, limits, and rendering.
+- Preconfigure every non-secret development setting, including `gpt-5.6-sol`, Codex auth and login method, `/tmp` traces, a direct durable session path, skills, limits, and rendering.
 - Add source/test subpackages.
 - Configure pytest, Ruff, and static type checking.
 - Add runtime and development dependencies through uv.
@@ -1190,8 +1183,8 @@ Acceptance criteria:
 
 ### Phase 3: OpenAI text-only vertical slice
 
-- Implement public OpenAI Responses API and Codex backend request conversion and streaming normalization.
-- Implement Codex device-code login, durable credential storage, account-ID extraction, and refresh.
+- Implement public OpenAI Responses API and SSE-only Codex backend request conversion and streaming normalization.
+- Implement Codex manual browser and headless device-code login, durable credential storage, account-ID extraction, and refresh by following Pi's OAuth protocol.
 - Add a minimal one-turn runner.
 - Connect the root runner's line input, OpenAI streaming, terminal rendering, and trace recording.
 - Add cancellation and normalized provider/authentication errors.
@@ -1199,7 +1192,7 @@ Acceptance criteria:
 Acceptance criteria:
 
 - With `auth_mode="api_key"`, a user can run a text-only conversation using `OPENAI_API_KEY`.
-- With `auth_mode="codex"`, missing credentials trigger headless login and a text-only conversation can use the stored/refreshed credential.
+- With `auth_mode="codex"`, missing credentials trigger the configured browser or headless login and a text-only conversation can use the stored/refreshed credential.
 - Raw sanitized and normalized events are visible in the trace.
 - Neither transport sends a tool schema.
 
@@ -1213,7 +1206,9 @@ Acceptance criteria:
 Acceptance criteria:
 
 - Arbitrary provider chunking cannot cause premature execution.
-- Malformed/incomplete blocks are never executed.
+- The provider stream is drained through its terminal event after `</exec>` arrives.
+- Prose after one complete execution block is accepted.
+- Malformed/incomplete blocks and all blocks from `length` responses are never executed.
 
 ### Phase 5: Persistent Jupyter kernel
 
@@ -1243,7 +1238,7 @@ Acceptance criteria:
 
 - Implement versioned semantic entries and append/load behavior.
 - Connect final message and kernel-state persistence.
-- Implement new/resume/ephemeral-session behavior configured by `RunConfig` and interactive commands.
+- Create or resume the directly configured `RunConfig.session_path`; start a fresh kernel when resuming an existing ledger.
 - Keep trace logs completely independent.
 
 Acceptance criteria:
@@ -1256,7 +1251,8 @@ Acceptance criteria:
 
 - Implement the local RPC server, namespace registry, prompt-contribution interface, and kernel-side proxy/bootstrap.
 - Implement the simple todo service and kernel restart control; do not add an environment namespace.
-- Implement Pi-style skill discovery, prompt summaries, and dynamic `tools.skills.load()`.
+- Implement Pi-style skill discovery, prompt summaries, and dynamic `tools.skills.load()` without project trust gating.
+- Implement Pi-style context-file discovery and deterministic project-instruction prompt composition.
 - Persist todo and restart state transitions.
 - Add unit and integration tests.
 
@@ -1265,35 +1261,24 @@ Acceptance criteria:
 - `tools.todo.create(...)`, `get`, `update`, `list`, and `clear` have the specified minimal state and return behavior.
 - `help(tools.todo.create)` is useful while todo's system-prompt contribution stays minimal.
 - Every visible discovered skill is summarized in the prompt, and its full instructions load only on demand.
-- Restart requests happen after cell completion without deadlock.
+- Restart requests happen after cell completion without deadlock, preserve the old generation's completed execution, and append a fresh-generation model notice before another provider request.
 
 ### Phase 9: Operational robustness
 
-- Implement execution timeout, interrupt grace period, forced restart, output limits, artifacts, and kernel-death recovery.
+- Implement execution timeout, interrupt grace period, forced restart, and kernel-death recovery.
 - Add failure-injection tests.
 
 Acceptance criteria:
 
 - Infinite Python code can be interrupted.
 - An unresponsive kernel can be replaced without losing session history.
-- Large output does not flood model context or the terminal irrecoverably.
+- Kernel replacement produces explicit generation changes and model-visible state-loss notices.
 
-### Phase 10: Context management
-
-- Implement context estimation and bounded output conversion.
-- Add manual compaction and compaction entries.
-- Add automatic compaction only after manual behavior is reliable.
-
-Acceptance criteria:
-
-- Long sessions remain within configured model context limits.
-- Compaction preserves recent actionable state and does not falsely promise restored kernel memory.
-
-### Phase 11: Line-interface refinement
+### Phase 10: Line-interface refinement
 
 - Improve readable stream composition, prompts, usage display, session commands, and shutdown behavior.
 - Keep the interface line-oriented and startup configuration in root `run.py`; do not add raw arguments.
-- Document operation, authentication, security model, session files, temporary traces/artifacts, skills, and troubleshooting.
+- Document operation, authentication, security model, session files, temporary traces, skills, deferred output limits/compaction, and troubleshooting.
 
 Acceptance criteria:
 
@@ -1305,15 +1290,15 @@ Acceptance criteria:
 The initial implementation is complete when:
 
 1. `uv run run.py` starts a preconfigured line-oriented OpenAI session without raw arguments.
-2. Both `OPENAI_API_KEY` and refreshable OpenAI Codex device-code credentials are supported.
+2. Both `OPENAI_API_KEY` and refreshable OpenAI Codex credentials obtained through manual browser or headless device-code login are supported.
 3. No JSON tool schemas or native tool calls are sent to either OpenAI transport.
 4. Complete line-anchored `<exec>` blocks run in a persistent child Python kernel.
-5. The model receives ordered, escaped, bounded execution observations.
+5. The model receives complete ordered and escaped execution observations.
 6. Assistant prose, Python code, output, results, and errors render readably in the terminal.
 7. A separate trace `.log` under `/tmp/py-code-act/traces` exposes provider, parser, agent, kernel, and persistence activity with correlation IDs.
 8. Session JSONL remains durable outside `/tmp`, stores only semantic history, and can resume with an explicitly fresh kernel.
 9. The minimal `tools.todo`, progressive `tools.skills`, and kernel restart control work through dedicated RPC.
-10. Cancellation, kernel replacement, output truncation, and temporary artifacts work predictably.
+10. Cancellation, deferred restart requests, and forced kernel replacement work predictably.
 11. The normal automated test suite uses no paid provider calls.
 12. OpenAI public API and OpenAI Codex are the only provider transports in the repository.
 
