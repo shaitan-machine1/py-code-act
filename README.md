@@ -45,7 +45,7 @@ Set `auth_mode="codex"` and choose one `codex_login_method`:
 - `browser`: the harness prints an OpenAI authorization URL. Complete authorization, then copy the full callback URL from the browser address bar and paste it into the terminal. No local callback server is started.
 - `device_code`: the harness prints a verification URL and user code, then polls until authorization, cancellation, or expiry.
 
-The implementation follows Pi's Codex OAuth constants, PKCE/token protocol, account-ID extraction, refresh behavior, and `originator: pi` request identity. Refreshable credentials are saved with user-only permissions under the platform configuration directory (normally `~/.config/py-code-act/openai-codex.json`). Delete that file to force a new login.
+The implementation follows Pi's Codex OAuth constants, PKCE/token protocol, account-ID extraction, refresh behavior, and `originator: pi` request identity. The checked-in `run.py` stores refreshable credentials with user-only permissions at `.py-code-act/openai-codex.json` inside the repository. Delete that file to force a new login. Other callers can select a different location with `RunConfig.oauth_path`.
 
 ## Execution protocol
 

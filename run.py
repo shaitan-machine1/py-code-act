@@ -7,13 +7,16 @@ from py_code_act.application import run
 from py_code_act.config import RunConfig, TraceConfig
 
 ROOT = Path(__file__).parent
+REPO_STATE = ROOT / ".py-code-act"
+TEMP_STATE = Path("/tmp") / "py-code-act"
 
 CONFIG = RunConfig(
     model="gpt-5.6-sol",
     auth_mode="codex",
     codex_login_method="browser",
     cwd=ROOT,
-    session_path=ROOT / ".py-code-act" / "session.jsonl",
+    session_path=REPO_STATE / "session.jsonl",
+    oauth_path=REPO_STATE / "openai-codex.json",
     reasoning_level="medium",
     display_reasoning=False,
     max_turns=16,
@@ -25,7 +28,11 @@ CONFIG = RunConfig(
     provider_timeout_seconds=300.0,
     tool_rpc_timeout_seconds=30.0,
     skill_paths=(),
-    trace=TraceConfig(enabled=True, file=None, provider_raw=True),
+    trace=TraceConfig(
+        enabled=True,
+        file=TEMP_STATE / "traces" / "trace.jsonl",
+        provider_raw=True,
+    ),
 )
 
 if __name__ == "__main__":
