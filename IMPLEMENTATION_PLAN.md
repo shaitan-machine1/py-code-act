@@ -939,7 +939,8 @@ Interactive behavior:
 - Return to the input prompt when the run settles.
 - Support EOF to exit.
 - Support `Ctrl+C` cancellation.
-- Provide minimal slash commands only when required, initially `/quit`, `/new`, `/session`, and `/model` as they become implemented.
+- Recognize an exact `/quit` line while idle as a clean exit.
+- Do not add a general slash-command framework or any other commands initially; behavior changes remain explicit in `run.py`.
 
 `rich` may be used for colors and block formatting without adopting a full-screen TUI. Output must remain understandable without color.
 
@@ -1276,13 +1277,14 @@ Acceptance criteria:
 
 ### Phase 10: Line-interface refinement
 
-- Improve readable stream composition, prompts, usage display, session commands, and shutdown behavior.
+- Improve readable stream composition, prompts, usage display, `/quit`, and shutdown behavior without introducing a general command framework.
 - Keep the interface line-oriented and startup configuration in root `run.py`; do not add raw arguments.
 - Document operation, authentication, security model, session files, temporary traces, skills, deferred output limits/compaction, and troubleshooting.
 
 Acceptance criteria:
 
 - `uv run run.py` is usable for normal repository work without a full-screen TUI.
+- EOF and an exact `/quit` line exit cleanly while idle.
 - Terminal output remains readable when redirected or color is disabled.
 
 ## 25. Cross-cutting acceptance criteria
